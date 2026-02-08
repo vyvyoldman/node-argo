@@ -2,135 +2,123 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 
-// ================= 环境变量配置 =================
-// 必填：你的 UUID
+// ================= 1. 核心配置 =================
 const UUID = process.env.UUID || '0dff8b4c-f778-4648-8817-3a434f7fa443';
-// 必填：Cloudflare Tunnel Token
-const ARGO_AUTH = process.env.ARGO_AUTH || 'eyJhIjoiMDU5NDkzODljMmM3YTZkNGJiNjU5OTU2MThhN2FiYzAiLCJ0IjoiYjAyNmM2ZTctODRiZi00YjRlLTkwZmMtNDRjMGFmYzBlMGQ1IiwicyI6Ik0yTXlZMkk0TkdVdE5tTTJZUzAwWkdOaExUZzFZV1l0WldVME5qSmlaR0V6WkdVNCJ9'; 
-// 必填：你的域名 (用于生成链接)
+const ARGO_AUTH = process.env.ARGO_AUTH || 'eyJhIjoiMDU5NDkzODljMmM3YTZkNGJiNjU5OTU2MThhN2FiYzAiLCJ0IjoiYjAyNmM2ZTctODRiZi00YjRlLTkwZmMtNDRjMGFmYzBlMGQ1IiwicyI6Ik0yTXlZMkk0TkdVdE5tTTJZUzAwWkdOaExUZzFZV1l0WldVME5qSmlaR0V6WkdVNCJ9';
 const ARGO_DOMAIN = process.env.ARGO_DOMAIN || 'sap.wow83168.de5.net';
 
-const PORT = process.env.PORT || 3000; 
-// 必须优先使用 process.env.PORT
-const FILE_PATH = './tmp';
+// SAP 分配的端口 (必须监听这个端口，否则容器会被杀)
+const PORT = process.env.PORT || 8080;
 
-// ================= 初始化目录 =================
-if (!fs.existsSync(FILE_PATH)) fs.mkdirSync(FILE_PATH);
+// 定义内部端口 (Xray 躲在这里)
+const INTERNAL_PORT = 5555;
+const APP_DIR = path.join(__dirname, 'sap_app');
 
-// ================= 1. 极简 HTTP 服务 (替代 Express) =================
-// 只有 10 行代码，内存占用极低
+// ================= 2. 初始化环境 =================
+if (!fs.existsSync(APP_DIR)) fs.mkdirSync(APP_DIR);
+
+// ================= 3. 启动保活 Web 服务 =================
+// 这一步是为了通过 SAP 的 Health Check
 const server = http.createServer((req, res) => {
-  if (req.url === '/') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('VLESS Worker is Alive.\n');
-  } else {
-    res.writeHead(404);
-    res.end();
-  }
+    // 伪装成一个正常的应用
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+        status: "UP",
+        msg: "SAP BTP Container is Healthy",
+        timestamp: new Date().toISOString()
+    }));
 });
 
 server.listen(PORT, () => {
-  console.log(`Lite Server running on port ${PORT}`);
-  startService(); // 服务启动后，开始下载和运行节点
+    console.log(`[SAP] Health Check Server listening on port ${PORT}`);
+    // Web 服务启动成功后，开始后台任务
+    startBackend();
 });
 
-// ================= 2. 核心逻辑 =================
-async function startService() {
-  const webPath = path.join(FILE_PATH, 'web'); // xray/sing-box
-  const botPath = path.join(FILE_PATH, 'bot'); // cloudflared
-  const configPath = path.join(FILE_PATH, 'config.json');
+// ================= 4. 后台核心逻辑 =================
+async function startBackend() {
+    const coreBin = path.join(APP_DIR, 'web');     // Xray/Singbox
+    const tunnelBin = path.join(APP_DIR, 'bot');   // Cloudflared
+    const configFile = path.join(APP_DIR, 'config.json');
 
-  // A. 下载依赖 (原生 https，不依赖 axios)
-  await downloadFile(`https://${getArch()}.ssss.nyc.mn/web`, webPath);
-  await downloadFile(`https://${getArch()}.ssss.nyc.mn/bot`, botPath);
+    // A. 下载依赖
+    // 检测架构: SAP BTP 通常是 amd64 (x86_64)
+    const arch = ['arm', 'arm64', 'aarch64'].includes(process.arch) ? 'arm64' : 'amd64';
+    
+    await download(`https://${arch}.ssss.nyc.mn/web`, coreBin);
+    await download(`https://${arch}.ssss.nyc.mn/bot`, tunnelBin);
 
-  // B. 生成 VLESS 配置 (监听 8080)
-  const config = {
-    log: { loglevel: "none" },
-    inbounds: [{
-      port: 8080,
-      listen: "127.0.0.1",
-      protocol: "vless",
-      settings: { clients: [{ id: UUID }], decryption: "none" },
-      streamSettings: { network: "ws", wsSettings: { path: "/vless" } }
-    }],
-    outbounds: [{ protocol: "freedom" }]
-  };
-  fs.writeFileSync(configPath, JSON.stringify(config));
-
-  // C. 启动进程 (关键！内存锁)
-  // Xray/Sing-box: 限制 25MB
-  runProcess(webPath, ['-c', configPath], 'Core', '25MiB');
-
-  // Cloudflared: 限制 40MB
-  if (ARGO_AUTH) {
-    runProcess(botPath, 
-      ['tunnel', '--edge-ip-version', 'auto', '--no-autoupdate', '--protocol', 'http2', 'run', '--token', ARGO_AUTH], 
-      'Tunnel', '40MiB'
-    );
-  } else {
-    console.log('❌ 未检测到 ARGO_AUTH，隧道无法启动！');
-  }
-
-  // D. 打印订阅链接
-  setTimeout(() => {
-    console.log('\n=======================================');
-    console.log(`🔗 VLESS 链接:`);
-    console.log(`vless://${UUID}@www.visa.com.sg:443?encryption=none&security=tls&sni=${ARGO_DOMAIN}&type=ws&host=${ARGO_DOMAIN}&path=%2Fvless#Node-100MB`);
-    console.log('=======================================\n');
-  }, 5000);
-}
-
-// ================= 辅助函数 =================
-
-// 1. 进程启动器 (带 GOMEMLIMIT)
-function runProcess(command, args, name, memLimit) {
-  // 设置权限
-  try { fs.chmodSync(command, 0o775); } catch (e) {}
-
-  const child = spawn(command, args, {
-    stdio: 'inherit', // 直接输出日志到控制台，不缓存
-    env: {
-      ...process.env,
-      GOGC: '10',         // 激进回收：垃圾增加 10% 就回收
-      GOMEMLIMIT: memLimit // 硬限：超过这个值强制 GC，绝不溢出
+    // B. 赋予执行权限 (关键修复)
+    try {
+        fs.chmodSync(coreBin, 0o755);
+        fs.chmodSync(tunnelBin, 0o755);
+    } catch (e) {
+        // 如果 chmod 失败，尝试 shell 命令
+        try { execSync(`chmod +x ${coreBin} ${tunnelBin}`); } catch (e) {}
     }
-  });
 
-  console.log(`🚀 ${name} started with limit: ${memLimit}`);
-  
-  child.on('exit', (code) => {
-    console.log(`⚠️ ${name} exited with code ${code}`);
-    // 如果核心进程挂了，杀掉整个容器重启，防止僵尸进程
-    process.exit(1);
-  });
-}
+    // C. 生成配置 (监听内部 5555)
+    const config = {
+        log: { loglevel: "none" },
+        inbounds: [{
+            port: INTERNAL_PORT,
+            listen: "127.0.0.1", // 只允许本地访问，安全
+            protocol: "vless",
+            settings: { clients: [{ id: UUID }], decryption: "none" },
+            streamSettings: { network: "ws", wsSettings: { path: "/vless" } }
+        }],
+        outbounds: [{ protocol: "freedom" }]
+    };
+    fs.writeFileSync(configFile, JSON.stringify(config));
 
-// 2. 原生下载器
-function downloadFile(url, dest) {
-  return new Promise((resolve, reject) => {
-    if (fs.existsSync(dest)) {
-      console.log(`[Skip] ${path.basename(dest)} exists.`);
-      return resolve();
+    // D. 启动 Tunnel (地道模式)
+    // 关键：Tunnel 直接把流量转发给 localhost:5555，绕过 SAP 的 PORT 限制
+    if (ARGO_AUTH) {
+        spawn(tunnelBin, ['tunnel', '--edge-ip-version', 'auto', '--no-autoupdate', '--protocol', 'http2', 'run', '--token', ARGO_AUTH, '--url', `http://localhost:${INTERNAL_PORT}`], {
+            stdio: 'inherit',
+            env: { ...process.env, GOMEMLIMIT: '100MiB' }
+        });
+        console.log('[SAP] Tunnel started.');
+    } else {
+        console.log('[Error] ARGO_AUTH is missing!');
     }
-    console.log(`[Down] Downloading ${path.basename(dest)}...`);
-    const file = fs.createWriteStream(dest);
-    https.get(url, (response) => {
-      response.pipe(file);
-      file.on('finish', () => {
-        file.close(resolve);
-      });
-    }).on('error', (err) => {
-      fs.unlink(dest, () => {});
-      reject(err.message);
+
+    // E. 启动 Xray (核心)
+    spawn(coreBin, ['-c', configFile], {
+        stdio: 'inherit',
+        env: { 
+            ...process.env, 
+            GOMAXPROCS: '1',     // 单核模式
+            GOGC: '50',          // 适中回收：既不浪费内存，也不狂吃 CPU
+            GOMEMLIMIT: '256MiB' // 内存限制
+        }
     });
-  });
+    console.log(`[SAP] Core running on internal port ${INTERNAL_PORT}`);
+
+    // 打印链接
+    setTimeout(() => {
+        console.log(`\n🔗 Link: vless://${UUID}@www.visa.com.sg:443?encryption=none&security=tls&sni=${ARGO_DOMAIN}&type=ws&host=${ARGO_DOMAIN}&path=%2Fvless#SAP-BTP`);
+    }, 3000);
 }
 
-// 3. 架构判断
-function getArch() {
-  const arch = process.arch;
-  return ['arm', 'arm64', 'aarch64'].includes(arch) ? 'arm64' : 'amd64';
+// ================= 5. 工具函数 =================
+function download(url, dest) {
+    return new Promise((resolve, reject) => {
+        if (fs.existsSync(dest)) return resolve(); // 存在则跳过
+        console.log(`[Down] Downloading to ${dest}...`);
+        const file = fs.createWriteStream(dest);
+        https.get(url, (res) => {
+            if (res.statusCode !== 200) {
+                fs.unlink(dest, () => {});
+                return reject(`Download failed: ${res.statusCode}`);
+            }
+            res.pipe(file);
+            file.on('finish', () => file.close(resolve));
+        }).on('error', (err) => {
+            fs.unlink(dest, () => {});
+            reject(err.message);
+        });
+    });
 }
