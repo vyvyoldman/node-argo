@@ -12,7 +12,8 @@ const ARGO_AUTH = process.env.ARGO_AUTH || 'eyJhIjoiMDU5NDkzODljMmM3YTZkNGJiNjU5
 // 必填：你的域名 (用于生成链接)
 const ARGO_DOMAIN = process.env.ARGO_DOMAIN || 'sap.wow83168.de5.net';
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000; 
+// 必须优先使用 process.env.PORT
 const FILE_PATH = './tmp';
 
 // ================= 初始化目录 =================
